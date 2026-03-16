@@ -1,0 +1,132 @@
+---
+description: Lead Finder project architecture, conventions, and development guide
+globs:
+alwaysApply: true
+---
+
+# Lead Finder — Project Rules
+
+## Architecture Overview
+
+This is a Next.js 16 (App Router) application with a SQLite database (Drizzle ORM), an Apify-powered scraping layer, and an AI abstraction layer supporting OpenAI and Anthropic. It also exposes a CLI for headless operation.
+
+### Key Layers
+
+- **UI** (`src/app/(dashboard)/`) — React server/client components using shadcn/ui
+- **API** (`src/app/api/`) — Next.js route handlers (REST-style)
+- **AI** (`src/lib/ai/`) — Provider-agnostic AI completions, lead scoring, field extraction, campaign planning
+- **Apify** (`src/lib/apify/`) — Actor registry, runner, input coercion, result normalization
+- **Enrichment** (`src/lib/enrichment/pipeline.ts`) — Orchestrates multi-actor enrichment per lead
+- **Database** (`src/lib/db/`) — Drizzle ORM schema, connection, migrations, seed
+- **CLI** (`cli/`) — Commander.js commands for discover, enrich, status
+- **Events** (`src/lib/events/emitter.ts`) — EventEmitter for SSE-based real-time lead updates
+
+## Database
+
+- SQLite via `better-sqlite3`, stored at `./lead-finder.db`
+- Schema defined in `src/lib/db/schema.ts`
+- Access the database via `getDb()` from `src/lib/db/index.ts` (singleton pattern)
+- Migrations live in `drizzle/`, generated with `npm run db:generate`, applied with `npm run db:migrate`
+- All JSON columns use Drizzle's `{ mode: "json" }` with `$type<T>()` for type safety
+
+### Tables
+
+| Table | Purpose |
+|-------|---------|
+| `campaigns` | Lead discovery campaigns with actor configs, KPI definitions, scheduling |
+| `leads` | Discovered leads with mapped data, scores, cost tracking |
+| `lead_personalization` | Enrichment results, KPI evaluations, pain points |
+| `apify_runs` | Apify actor run tracking (status, cost, dataset IDs) |
+| `analytics_events` | Event log for analytics |
+| `custom_actors` | User-added Apify actors from the store |
+| `llm_costs` | Per-operation LLM cost tracking |
+| `settings` | Key-value settings (API keys, agency profile) |
+
+## AI Provider Abstraction
+
+All AI calls go through `generateCompletion()` in `src/lib/ai/provider.ts`.
+
+- Supports `"openai"` (GPT-4o) and `"anthropic"` (Claude Sonnet 4)
+- Returns structured `AIResponse` with token counts and cost
+- Cost is automatically logged to `llm_costs` table via `logLlmCost()`
+- Default provider is configurable per-campaign or globally in settings
+
+When adding new AI operations:
+1. Use `generateCompletion()` — never call OpenAI/Anthropic SDKs directly
+2. Always call `logLlmCost()` after to track costs
+3. Parse JSON responses with try/catch — LLMs may return malformed JSON
+
+## Apify Integration
+
+### Actor Registry
+
+Built-in actors are defined in `src/lib/apify/registry.ts`. Each actor has:
+- `id` — Apify actor ID (e.g. `compass/crawler-google-places`)
+- `phase` — `"find"` (discovery) or `"enrich"` (enrichment)
+- `requiredInputFields` — Fields needed to run the actor
+- `inputFieldDescriptions` — UI hints for input configuration
+- `defaultInput` — Default input values
+
+Custom actors are stored in the `custom_actors` DB table and merged at runtime via `src/lib/apify/registry-server.ts`.
+
+### Adding a New Built-in Actor
+
+1. Add the actor definition to `ACTOR_REGISTRY` in `src/lib/apify/registry.ts`
+2. Set `phase` to `"find"` or `"enrich"`
+3. Define `requiredInputFields` and `inputFieldDescriptions`
+4. If needed, add normalization logic in `src/lib/apify/normalizer.ts`
+
+### Data Flow
+
+1. `src/lib/apify/runner.ts` — Calls Apify API to start actors, poll for completion, fetch results
+2. `src/lib/apify/coerce-input.ts` — Transforms user input to match actor-expected formats
+3. `src/lib/apify/normalizer.ts` — AI-powered normalization of raw actor output to structured lead data
+4. `src/lib/apify/discovery.ts` — Orchestrates full discovery: run actor → normalize → deduplicate → insert leads
+
+## Enrichment Pipeline
+
+`src/lib/enrichment/pipeline.ts` handles per-lead enrichment:
+
+1. Run enrichment actors (contact scraper, social scrapers) against the lead's website
+2. Use AI to extract structured fields and evaluate KPIs from combined data
+3. Score the lead with AI based on agency profile and enrichment data
+4. Update lead status, mapped data, and personalization record
+
+Enrichment supports concurrency control (configurable in settings) and cancellation.
+
+## API Routes
+
+All API routes are in `src/app/api/`. They follow this pattern:
+- Use `NextResponse.json()` for responses
+- Access DB via `getDb()` at call time (not module level)
+- Validate input with Zod or manual checks
+- Return appropriate HTTP status codes
+
+### Key Routes
+
+- `POST /api/campaigns/[id]/discover` — Trigger lead discovery for a campaign
+- `POST /api/campaigns/[id]/enrich` — Trigger enrichment for campaign leads
+- `POST /api/campaigns/plan` — AI-generated campaign plan from a niche description
+- `GET /api/events/leads` — SSE endpoint for real-time lead updates
+- `POST /api/leads/ai-filter` — AI-powered natural language lead filtering
+- `GET /api/analytics/export` — CSV export of leads
+
+## Conventions
+
+- **TypeScript** everywhere, strict mode
+- **No `any`** types — use `unknown` and narrow
+- **Imports** use `@/` path alias mapping to `src/`
+- **UI components** from `@/components/ui/` (shadcn/ui, do not modify)
+- **Toasts** via `sonner` (`toast.success()`, `toast.error()`)
+- **Forms** use `react-hook-form` + `zod` for validation
+- **Date handling** via `date-fns`
+- **Styling** with Tailwind CSS v4
+
+## Development Commands
+
+```
+npm run dev          # Dev server (Turbopack)
+npm run db:generate  # Generate migration from schema changes
+npm run db:migrate   # Apply migrations + seed
+npm run cli          # Run CLI (add command after, e.g. npm run cli status)
+```
